@@ -1,6 +1,6 @@
 'use strict';
 const $=s=>document.querySelector(s); const fmt=(x,n=2)=>Number(x).toLocaleString('pt-BR',{minimumFractionDigits:n,maximumFractionDigits:n});
-const state={points:[],project:()=>$('#project').value.trim()||'Levantamento',notes:()=>$('#notes').value.trim()};
+const state={points:[],inputMode:null,importVersion:0,project:()=>$('#project').value.trim()||'Levantamento',notes:()=>$('#notes').value.trim()};
 function clean(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function download(name,content,mime){const blob=new Blob([content],{type:mime});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
 function parseJpeg(buffer){const dv=new DataView(buffer);let pos=2,exif={},xmp={};if(dv.getUint16(0)!==0xffd8)throw Error('Arquivo não é JPEG válido');while(pos+4<buffer.byteLength){if(dv.getUint8(pos)!==255)break;let marker=dv.getUint8(pos+1);if(marker===0xda||marker===0xd9)break;if(marker===0xff){pos++;continue}const len=dv.getUint16(pos+2);if(len<2||pos+2+len>buffer.byteLength)break;if(marker===0xe1){const segment=new Uint8Array(buffer,pos+4,len-2);const header=String.fromCharCode(...segment.slice(0,Math.min(40,segment.length)));if(header.startsWith('Exif\0\0'))exif=readTiff(buffer,pos+4+6);else if(header.includes('xap/1.0/')||header.includes('<?xpacket'))Object.assign(xmp,readXmp(new TextDecoder('utf-8').decode(segment)));}pos+=2+len;}return {...exif,...xmp};}
@@ -31,10 +31,46 @@ function svg(c,labels=true){const pts=c.xy,w=640,h=400,pad=70,minx=Math.min(...p
 function render(){const pts=state.points,c=calc();const le=$('#learnExample');if(le)le.textContent=c?`Exemplo com seu levantamento: ${pts.length} vértices, área de ${fmt(c.area)} m² (${fmt(c.area/10000,4)} ha), método: ${methodLabel()}. A ordem dos pontos define o contorno.`:'Carregue três ou mais pontos para ver o resultado aplicado ao seu levantamento.';$('#methodHelp').textContent=$('#areaMethod').value==='sphere'?'Área esférica (raio 6.371 km), compatível com o teste no Google Earth.':'Área calculada por projeção local tangente no elipsoide WGS84.';$('#methodologyText').textContent='Distâncias geodésicas por Vincenty; área: '+methodLabel()+'. A precisão depende das coordenadas de campo.';$('#count').textContent=pts.length;$('#vertices').textContent=pts.length;$('#status').textContent=c?(c.crossing?'Poligonal cruzada':'Poligonal calculada'):'Aguardando pontos';$('#status').classList.toggle('ok',!!c&&!c.crossing);$('#area').textContent=c?fmt(c.area)+' m²':'—';$('#perimeter').textContent=c?fmt(c.per)+' m':'—';$('#hectares').textContent=c?fmt(c.area/10000,4)+' hectares':'— hectares';$('#pointList').innerHTML=pts.length?pts.map((p,i)=>`<div class="point"><span class="tag">P${i+1}</span><div class="pointinfo"><b title="${clean(p.name)}">${clean(p.name||'Coordenada manual')}</b><small>${fmt(p.lat,8)}, ${fmt(p.lon,8)}</small><small>${clean(p.date||'Sem data/hora')}${p.gimbal!=null?' • Gimbal '+fmt(p.gimbal,1)+'°':''}</small></div><div class="pointtools"><button title="Subir" data-move="${i},-1">↑</button><button title="Descer" data-move="${i},1">↓</button><button title="Excluir" data-del="${i}">×</button></div></div>`).join(''):'<div class="empty-small">Nenhum ponto importado.</div>';$('#segments').innerHTML=c?pts.map((_,i)=>`<tr><td>P${i+1} → P${(i+1)%pts.length+1}</td><td><b>${fmt(c.lengths[i])} m</b></td><td>${fmt(c.angles[i])}°</td></tr>`).join(''):'<tr><td colspan="3" class="muted">Sem medidas calculadas</td></tr>';$('#poly').outerHTML=c?svg(c).replace('<svg ','<svg id="poly" '):'<svg id="poly" viewBox="0 0 640 400"><text x="320" y="195" text-anchor="middle" fill="#91a19e" font-size="16">Importe pelo menos 3 pontos para visualizar.</text></svg>';let alerts=[];if(c?.crossing)alerts.push('A poligonal tem lados que se cruzam. Revise a ordem dos pontos antes de usar a área.');for(let i=0;i<pts.length;i++)if(pts[i].gimbal!=null&&Math.abs(pts[i].gimbal+90)>5)alerts.push(`P${i+1}: gimbal em ${fmt(pts[i].gimbal,1)}° (fora da tolerância visual de ±5° de −90°).`);$('#alerts').innerHTML=alerts.map(a=>`<div class="alert">⚠ ${clean(a)}</div>`).join('');scheduleGeo();}
 $('#pointList').addEventListener('click',e=>{const m=e.target.closest('[data-move]'),d=e.target.closest('[data-del]');if(m){const [i,k]=m.dataset.move.split(',').map(Number),j=i+k;if(j>=0&&j<state.points.length){[state.points[i],state.points[j]]=[state.points[j],state.points[i]];render();}}if(d){state.points.splice(Number(d.dataset.del),1);render();}});
 for(const el of document.querySelectorAll('[data-tab]'))el.addEventListener('click',()=>{document.querySelectorAll('[data-tab]').forEach(t=>t.classList.toggle('active',t===el));document.querySelectorAll('.tab-content').forEach(t=>t.classList.toggle('hidden',t.id!==el.dataset.tab));});
-async function importFiles(files){const failures=[],success=[];for(const f of [...files]){try{success.push(await readPhoto(f));}catch(e){failures.push(`${f.name}: ${e.message}`);}}state.points.push(...success);state.points.sort((a,b)=>String(a.date||'').localeCompare(String(b.date||''))||a.name.localeCompare(b.name));render();if(failures.length)alert('Alguns arquivos foram ignorados:\n'+failures.join('\n'));}
+async function importFiles(files){
+  const selection=[...files];if(!selection.length)return;
+  // Cada nova importação é um levantamento fotográfico independente.
+  // Nunca misturar com pontos digitados nem com importações anteriores.
+  const version=++state.importVersion;
+  state.inputMode='photos';
+  state.points=[];
+  $('#manualText').value='';
+  render();
+  const failures=[],success=[];
+  for(const f of selection){
+    try{success.push(await readPhoto(f));}catch(e){failures.push(`${f.name}: ${e.message}`);}
+    if(version!==state.importVersion)return; // cancelado por Limpar tudo ou entrada manual
+  }
+  if(version!==state.importVersion)return;
+  state.points=success.sort((a,b)=>String(a.date||'').localeCompare(String(b.date||''))||a.name.localeCompare(b.name));
+  render();
+  if(failures.length)alert('Alguns arquivos foram ignorados:\n'+failures.join('\n'));
+}
 $('#files').addEventListener('change',e=>{importFiles(e.target.files);e.target.value='';});const drop=$('#drop');drop.addEventListener('dragover',e=>{e.preventDefault();drop.classList.add('drag')});drop.addEventListener('dragleave',()=>drop.classList.remove('drag'));drop.addEventListener('drop',e=>{e.preventDefault();drop.classList.remove('drag');importFiles(e.dataTransfer.files)});
-$('#applyManual').onclick=()=>{const lines=$('#manualText').value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean),pts=[];for(const [i,line] of lines.entries()){const match=line.match(/^\s*([-+]?\d+(?:\.\d+)?)\s*[,;\s]\s*([-+]?\d+(?:\.\d+)?)\s*$/);if(!match){alert('Linha '+(i+1)+' inválida. Use latitude, longitude em formato decimal.');return;}const lat=+match[1],lon=+match[2];if(Math.abs(lat)>90||Math.abs(lon)>180){alert('Coordenada fora de faixa na linha '+(i+1));return;}pts.push({lat,lon,name:'Ponto manual '+(i+1),date:''});}state.points=pts;render();};
-$('#demo').onclick=()=>{$('#manualText').value='-20.345955846, -40.365429335\n-20.346257359, -40.365063840\n-20.346592153, -40.365413474\n-20.346289748, -40.365766456';$('#applyManual').click();};$('#clear').onclick=()=>{state.points=[];$('#manualText').value='';render();};$('#areaMethod').onchange=render;$('#showAngles').onchange=render;$('#showLengths').onchange=render;
+$('#applyManual').onclick=()=>{const lines=$('#manualText').value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean),pts=[];for(const [i,line] of lines.entries()){const match=line.match(/^\s*([-+]?\d+(?:\.\d+)?)\s*[,;\s]\s*([-+]?\d+(?:\.\d+)?)\s*$/);if(!match){alert('Linha '+(i+1)+' inválida. Use latitude, longitude em formato decimal.');return;}const lat=+match[1],lon=+match[2];if(Math.abs(lat)>90||Math.abs(lon)>180){alert('Coordenada fora de faixa na linha '+(i+1));return;}pts.push({lat,lon,name:'Ponto manual '+(i+1),date:''});}state.importVersion++;state.inputMode='manual';state.points=pts;$('#files').value='';render();};
+$('#demo').onclick=()=>{$('#manualText').value='-20.345955846, -40.365429335\n-20.346257359, -40.365063840\n-20.346592153, -40.365413474\n-20.346289748, -40.365766456';$('#applyManual').click();};$('#clear').onclick=()=>{
+  state.importVersion++;
+  state.inputMode=null;
+  state.points=[];
+  $('#files').value='';
+  $('#manualText').value='';
+  $('#project').value='Teste de levantamento';
+  $('#notes').value='';
+  $('#areaMethod').value='wgs84';
+  $('#showAngles').checked=true;
+  $('#showLengths').checked=true;
+  $('#geoEditFields').classList.add('hidden');
+  for(const id of ['geoCountryInput','geoStateInput','geoCityInput','geoUFInput'])$('#'+id).value='';
+  clearTimeout(geoState.timer);geoState.requestId++;
+  Object.assign(geoState,{country:'',region:'',city:'',uf:'',source:'',key:'',pending:''});
+  // Um link compartilhado antigo não deve restaurar o levantamento ao atualizar.
+  if(location.hash.startsWith('#talhao='))history.replaceState(null,'',location.pathname+location.search);
+  render();
+};$('#areaMethod').onchange=render;$('#showAngles').onchange=render;$('#showLengths').onchange=render;
 function must(){const c=calc();if(!c){alert('Importe pelo menos três vértices antes de exportar.');return null;}if(c.crossing&&!confirm('A poligonal tem cruzamentos. Deseja exportar mesmo assim?'))return null;return c;}
 $('#csv').onclick=()=>{const c=must();if(!c)return;let s='Ponto;Arquivo;DataHora;Latitude;Longitude;AltitudeGPS;AltitudeDJI;AltitudeRelativa;Gimbal;DistanciaAteProximo_m;AnguloInterno_graus\r\n';state.points.forEach((p,i)=>{s+=[`P${i+1}`,p.name||'',p.date||'',p.lat,p.lon,p.gpsAltitude??'',p.absoluteAltitude??'',p.relativeAltitude??'',p.gimbal??'',c.lengths[i].toFixed(3),c.angles[i].toFixed(3)].join(';')+'\r\n'});s+=`PAIS;${geoState.country}\r\nESTADO;${geoState.region}\r\nMUNICIPIO;${geoState.city}\r\nUF;${geoState.uf}\r\nMETODO_AREA;${methodLabel()}\r\nAREA_m2;${c.area.toFixed(3)}\r\nPERIMETRO_m;${c.per.toFixed(3)}\r\n`;download('talhao360-levantamento.csv','\ufeff'+s,'text/csv;charset=utf-8');};
 $('#kml').onclick=()=>{const c=must();if(!c)return;const p=state.points,coord=[...p,p[0]].map(q=>`${q.lon},${q.lat},0`).join(' ');const markers=p.map((q,i)=>`<Placemark><name>P${i+1}</name><Point><coordinates>${q.lon},${q.lat},0</coordinates></Point></Placemark>`).join('');download('talhao360-poligono.kml',`<?xml version="1.0" encoding="UTF-8"?><kml xmlns="http://www.opengis.net/kml/2.2"><Document><name>${clean(state.project())}</name><description>${clean('Localização: '+geoLabel())}</description><Style id="field"><LineStyle><color>ff538b28</color><width>3</width></LineStyle><PolyStyle><color>55488b30</color></PolyStyle></Style><Placemark><name>Talhão</name><styleUrl>#field</styleUrl><Polygon><outerBoundaryIs><LinearRing><coordinates>${coord}</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>${markers}</Document></kml>`,'application/vnd.google-earth.kml+xml');};
